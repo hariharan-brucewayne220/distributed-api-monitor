@@ -30,7 +30,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - model_cache:/models
+      - "D:\\models\\gpt-oss:/models"
+    device_requests:
+      - driver: nvidia
+        count: 1
+        capabilities: [gpu]
     deploy:
       resources:
         reservations:
