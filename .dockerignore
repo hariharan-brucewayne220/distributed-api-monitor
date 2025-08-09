@@ -1,0 +1,32 @@
+.git/
+.gitignore
+.DS_Store
+.vscode/
+.idea/
+
+# Python envs and caches
+ai-demo-env/
+gguf-server-env/
+shared-gpt-oss-env/
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+
+# Large archives/models
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.bin
+*.gguf
+
+# Notebooks
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
