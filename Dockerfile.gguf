@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir flask llama-cpp-python==0.3.15
+
+COPY gguf_server.py /app/gguf_server.py
+
+ENV MODEL_PATH=/models/gpt-oss-20b-MXFP4.gguf \
+    THREADS=4 \
+    CTX=2048 \
+    PORT=8000
+
+EXPOSE 8000
+
+CMD ["python", "-u", "gguf_server.py"]
+
+

@@ -329,7 +329,8 @@
             updateDashboard(data) {
                 const healthy = data.filter(d => d.isHealthy).length;
                 const unhealthy = data.length - healthy;
-                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime, 0) / data.length;
+                // Convert nanoseconds to milliseconds
+                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime / 1000000, 0) / data.length;
                 const uptime = (healthy / data.length) * 100;
 
                 document.getElementById('healthyCount').textContent = healthy;
@@ -358,7 +359,7 @@
                                 <span>Status:</span> <strong>${endpoint.statusCode}</strong>
                             </div>
                             <div class="metric">
-                                <span>Response Time:</span> <strong>${Math.round(endpoint.responseTime)}ms</strong>
+                                <span>Response Time:</span> <strong>${Math.round(endpoint.responseTime / 1000000)}ms</strong>
                             </div>
                             <div class="metric">
                                 <span>Last Check:</span> <strong>${new Date(endpoint.lastChecked).toLocaleTimeString()}</strong>
@@ -407,7 +408,8 @@
 
             updateChart(data) {
                 const now = new Date().toLocaleTimeString();
-                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime, 0) / data.length;
+                // Convert nanoseconds to milliseconds
+                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime / 1000000, 0) / data.length;
 
                 this.chart.data.labels.push(now);
                 this.chart.data.datasets[0].data.push(avgResponseTime);

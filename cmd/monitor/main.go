@@ -61,9 +61,9 @@ func main() {
 		fmt.Printf("=== Check Results at %s ===\n", time.Now().Format("15:04:05"))
 		
 		for _, result := range results {
-			status := "✅ HEALTHY"
+			status := "HEALTHY"
 			if !result.IsHealthy {
-				status = "❌ UNHEALTHY"
+				status = "UNHEALTHY"
 			}
 			
 			fmt.Printf("%s %s\n", status, result.URL)

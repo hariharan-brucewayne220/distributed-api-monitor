@@ -6,16 +6,22 @@ import os
 
 app = Flask(__name__)
 
-# Load GGUF model
-model_path = "/mnt/d/claude-projects/shared-models/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"
+# Load configuration from environment
+model_path = os.getenv("MODEL_PATH", "/models/gpt-oss-20b-MXFP4.gguf")
+num_threads = int(os.getenv("THREADS", "4"))
+context_size = int(os.getenv("CTX", "2048"))
+port = int(os.getenv("PORT", "8000"))
 
 print(f"🔄 Loading GGUF model from: {model_path}")
 try:
     llm = Llama(
         model_path=model_path,
-        n_ctx=2048,  # Context window
-        n_threads=4,  # CPU threads
-        verbose=False
+        n_ctx=context_size,
+        n_threads=num_threads,
+        n_gpu_layers=0,  # CPU-only by default
+        verbose=True,
+        use_mmap=True,
+        use_mlock=False,
     )
     print("✅ GGUF model loaded successfully!")
 except Exception as e:
@@ -85,6 +91,6 @@ def chat_completions():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("🚀 GGUF server starting on http://localhost:8000")
+    print(f"🚀 GGUF server starting on http://localhost:{port}")
     print(f"📁 Model: {model_path}")
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -17,29 +17,19 @@ services:
       timeout: 5s
       retries: 5
 
-  # GPT-OSS inference server (using vLLM for high performance)
+  # GPT-OSS inference server (GGUF local OpenAI-compatible)
   gpt-oss:
-    image: vllm/vllm-openai:latest
-    command: >
-      --model microsoft/DialoGPT-medium
-      --host 0.0.0.0 
-      --port 8000
-      --served-model-name gpt-oss-20b
-      --max-model-len 2048
-      --gpu-memory-utilization 0.8
+    build:
+      context: .
+      dockerfile: Dockerfile.gguf
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/models/gpt-oss-20b-MXFP4.gguf}
+      - THREADS=${THREADS:-4}
+      - CTX=${CTX:-2048}
     ports:
       - "8000:8000"
     volumes:
-      - model_cache:/root/.cache/huggingface
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - model_cache:/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -56,6 +46,7 @@ services:
       - AI_ENABLED=true
       - AI_BASE_URL=http://gpt-oss:8000
       - AI_API_KEY=demo-key
+      - AI_MODEL=gpt-oss-20b
       - WEB_PORT=8080
     depends_on:
       postgres:

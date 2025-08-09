@@ -62,15 +62,19 @@ type Choice struct {
 }
 
 // NewGPTOSSClient creates a new GPT-OSS client
-func NewGPTOSSClient(baseURL, apiKey string) *GPTOSSClient {
-	return &GPTOSSClient{
-		baseURL:     baseURL,
-		apiKey:      apiKey,
-		model:       "gpt-oss-20b", // Using the smaller model for faster responses
-		client:      &http.Client{Timeout: 30 * time.Second},
-		maxTokens:   512,
-		temperature: 0.3, // Lower temperature for more consistent analytical responses
-	}
+func NewGPTOSSClient(baseURL, apiKey, model string) *GPTOSSClient {
+    effectiveModel := strings.TrimSpace(model)
+    if effectiveModel == "" {
+        effectiveModel = "gpt-oss-20b"
+    }
+    return &GPTOSSClient{
+        baseURL:     baseURL,
+        apiKey:      apiKey,
+        model:       effectiveModel,
+        client:      &http.Client{Timeout: 30 * time.Second},
+        maxTokens:   512,
+        temperature: 0.3, // Lower temperature for more consistent analytical responses
+    }
 }
 
 // AnalyzeEndpoints generates AI insights from endpoint monitoring data

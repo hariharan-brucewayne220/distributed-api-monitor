@@ -40,9 +40,9 @@ func NewWebServer() *WebServer {
 	cfg := config.Load()
 	
 	var aiClient *ai.GPTOSSClient
-	if cfg.AIEnabled {
-		aiClient = ai.NewGPTOSSClient(cfg.AIBaseURL, cfg.AIAPIKey)
-	}
+    if cfg.AIEnabled {
+        aiClient = ai.NewGPTOSSClient(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel)
+    }
 	
 	return &WebServer{
 		checker:  checker.NewHTTPChecker(cfg.RequestTimeout),
