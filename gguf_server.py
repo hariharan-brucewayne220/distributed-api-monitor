@@ -10,6 +10,7 @@ app = Flask(__name__)
 model_path = os.getenv("MODEL_PATH", "/models/gpt-oss-20b-MXFP4.gguf")
 num_threads = int(os.getenv("THREADS", "4"))
 context_size = int(os.getenv("CTX", "2048"))
+gpu_layers = int(os.getenv("GPU_LAYERS", "0"))  # 0 = CPU-only
 port = int(os.getenv("PORT", "8000"))
 
 print(f"🔄 Loading GGUF model from: {model_path}")
@@ -18,7 +19,7 @@ try:
         model_path=model_path,
         n_ctx=context_size,
         n_threads=num_threads,
-        n_gpu_layers=0,  # CPU-only by default
+        n_gpu_layers=gpu_layers,
         verbose=True,
         use_mmap=True,
         use_mlock=False,

@@ -24,12 +24,20 @@ services:
       dockerfile: Dockerfile.gguf
     environment:
       - MODEL_PATH=${MODEL_PATH:-/models/gpt-oss-20b-MXFP4.gguf}
-      - THREADS=${THREADS:-4}
-      - CTX=${CTX:-2048}
+      - THREADS=${THREADS:-8}
+      - CTX=${CTX:-1024}
+      - GPU_LAYERS=${GPU_LAYERS:-35}
     ports:
       - "8000:8000"
     volumes:
       - model_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
