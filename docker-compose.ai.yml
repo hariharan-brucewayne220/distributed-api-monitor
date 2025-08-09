@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: api_monitor
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # GPT-OSS inference server (using vLLM for high performance)
+  gpt-oss:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model microsoft/DialoGPT-medium
+      --host 0.0.0.0 
+      --port 8000
+      --served-model-name gpt-oss-20b
+      --max-model-len 2048
+      --gpu-memory-utilization 0.8
+    ports:
+      - "8000:8000"
+    volumes:
+      - model_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # API Monitor web service
+  api-monitor:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=host=postgres port=5432 user=monitor password=password dbname=api_monitor sslmode=disable
+      - AI_ENABLED=true
+      - AI_BASE_URL=http://gpt-oss:8000
+      - AI_API_KEY=demo-key
+      - WEB_PORT=8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gpt-oss:
+        condition: service_healthy
+    volumes:
+      - ./web:/app/web
+
+volumes:
+  postgres_data:
+  model_cache:

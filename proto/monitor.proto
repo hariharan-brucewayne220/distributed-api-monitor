@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package monitor;
+
+option go_package = "api-monitor/proto/monitor";
+
+import "google/protobuf/timestamp.proto";
+
+// CheckResult represents a single health check result
+message CheckResult {
+  string url = 1;
+  int32 status_code = 2;
+  int64 response_time_ms = 3;
+  bool is_healthy = 4;
+  string error_message = 5;
+  google.protobuf.Timestamp checked_at = 6;
+}
+
+// Monitor endpoint configuration
+message MonitorEndpoint {
+  string id = 1;
+  string url = 2;
+  int32 interval_seconds = 3;
+  int32 timeout_seconds = 4;
+  bool enabled = 5;
+}
+
+// Request to add a new endpoint to monitor
+message AddEndpointRequest {
+  string url = 1;
+  int32 interval_seconds = 2;
+  int32 timeout_seconds = 3;
+}
+
+message AddEndpointResponse {
+  string endpoint_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+// Request to get recent results for an endpoint
+message GetResultsRequest {
+  string url = 1;
+  int32 limit = 2;
+}
+
+message GetResultsResponse {
+  repeated CheckResult results = 1;
+}
+
+// Request to get all monitored endpoints
+message ListEndpointsRequest {}
+
+message ListEndpointsResponse {
+  repeated MonitorEndpoint endpoints = 1;
+}
+
+// Real-time streaming of check results
+message StreamResultsRequest {
+  string url_filter = 1; // Optional: filter by URL pattern
+}
+
+// Service for managing monitoring configuration
+service MonitorManager {
+  // Add a new endpoint to monitor
+  rpc AddEndpoint(AddEndpointRequest) returns (AddEndpointResponse);
+  
+  // List all monitored endpoints
+  rpc ListEndpoints(ListEndpointsRequest) returns (ListEndpointsResponse);
+  
+  // Get historical results for an endpoint
+  rpc GetResults(GetResultsRequest) returns (GetResultsResponse);
+  
+  // Stream real-time check results
+  rpc StreamResults(StreamResultsRequest) returns (stream CheckResult);
+}

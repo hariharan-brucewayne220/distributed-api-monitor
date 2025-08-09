@@ -1,0 +1,40 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+.python-version
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+env/
+venv/
+.venv/
+ai-demo-env/
+gguf-server-env/
+shared-gpt-oss-env/
+
+# Node
+node_modules/
+
+# Env files
+.env
+.env.*.local
+
+# Notebooks
+.ipynb_checkpoints/
+
+
