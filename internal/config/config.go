@@ -6,25 +6,30 @@ import (
 	"time"
 )
 
+// DefaultLocalDatabaseURL matches the Postgres service in docker-compose.yml.
+// It is used by the CLIs when -db is requested and DATABASE_URL is unset; the
+// web server never assumes it (persistence there is opt-in via DATABASE_URL).
+const DefaultLocalDatabaseURL = "host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"
+
 // Config holds all configuration for the API monitor
 type Config struct {
-	// Database configuration
+	// Database configuration. Empty means persistence is disabled.
 	DatabaseURL string
-	
+
 	// Monitoring configuration
-	CheckInterval   time.Duration
-	RequestTimeout  time.Duration
-	MaxConcurrency  int
-	
+	CheckInterval  time.Duration
+	RequestTimeout time.Duration
+	MaxConcurrency int
+
 	// Web server configuration
 	WebPort int
-	
+
 	// AI configuration
-	AIEnabled   bool
-	AIBaseURL   string
-	AIAPIKey    string
-	AIModel     string
-	
+	AIEnabled bool
+	AIBaseURL string
+	AIAPIKey  string
+	AIModel   string
+
 	// Alerting configuration
 	AlertingEnabled bool
 	SlackWebhook    string
@@ -38,22 +43,22 @@ type Config struct {
 func Load() *Config {
 	return &Config{
 		// Database
-		DatabaseURL: getEnv("DATABASE_URL", "host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"),
-		
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+
 		// Monitoring
 		CheckInterval:  getDuration("CHECK_INTERVAL", 15*time.Second),
 		RequestTimeout: getDuration("REQUEST_TIMEOUT", 5*time.Second),
 		MaxConcurrency: getInt("MAX_CONCURRENCY", 10),
-		
+
 		// Web server
 		WebPort: getInt("WEB_PORT", 8080),
-		
+
 		// AI configuration (GPT-OSS)
 		AIEnabled: getBool("AI_ENABLED", true),
 		AIBaseURL: getEnv("AI_BASE_URL", "http://localhost:8000"), // Local GPT-OSS server
 		AIAPIKey:  getEnv("AI_API_KEY", "your-api-key-here"),
 		AIModel:   getEnv("AI_MODEL", "gpt-oss-20b"),
-		
+
 		// Alerting
 		AlertingEnabled: getBool("ALERTING_ENABLED", false),
 		SlackWebhook:    getEnv("SLACK_WEBHOOK", ""),
@@ -61,6 +66,17 @@ func Load() *Config {
 		EmailSMTPPort:   getInt("EMAIL_SMTP_PORT", 587),
 		EmailUsername:   getEnv("EMAIL_USERNAME", ""),
 		EmailPassword:   getEnv("EMAIL_PASSWORD", ""),
+	}
+}
+
+// DefaultEndpoints returns the public URLs monitored when none are configured.
+// A fresh slice is returned so callers may mutate it.
+func DefaultEndpoints() []string {
+	return []string{
+		"https://api.github.com/users/octocat",
+		"https://jsonplaceholder.typicode.com/posts/1",
+		"https://httpbin.org/status/200",
+		"https://httpbin.org/delay/2",
 	}
 }
 

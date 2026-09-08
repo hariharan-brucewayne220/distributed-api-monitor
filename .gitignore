@@ -38,3 +38,8 @@ node_modules/
 .ipynb_checkpoints/
 
 
+
+# Go build output / local toolchain
+*.exe
+/api-monitor
+/gopath/

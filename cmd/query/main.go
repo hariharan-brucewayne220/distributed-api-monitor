@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"log"
 
+	"api-monitor/internal/config"
 	"api-monitor/internal/storage"
 )
 
+// query prints the most recent stored results for one URL, plus simple
+// statistics. It reads DATABASE_URL, falling back to the docker-compose
+// Postgres defaults.
 func main() {
 	url := flag.String("url", "", "URL to query results for")
 	limit := flag.Int("limit", 10, "Number of recent results to fetch")
@@ -17,17 +21,19 @@ func main() {
 		log.Fatal("Please provide a URL with -url flag")
 	}
 
-	fmt.Printf("🔍 Querying results for: %s\n\n", *url)
+	fmt.Printf("Querying results for: %s\n\n", *url)
 
-	// Connect to database
-	connectionString := "host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"
-	store, err := storage.NewPostgresStore(connectionString)
+	cfg := config.Load()
+	dsn := cfg.DatabaseURL
+	if dsn == "" {
+		dsn = config.DefaultLocalDatabaseURL
+	}
+	store, err := storage.NewPostgresStore(dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer store.Close()
 
-	// Get recent results
 	results, err := store.GetRecentResults(*url, *limit)
 	if err != nil {
 		log.Fatalf("Failed to query results: %v", err)
@@ -38,17 +44,17 @@ func main() {
 		return
 	}
 
-	fmt.Printf("📊 Found %d recent results:\n\n", len(results))
+	fmt.Printf("Found %d recent results:\n\n", len(results))
 
 	for i, result := range results {
-		status := "✅ HEALTHY"
+		status := "HEALTHY"
 		if !result.IsHealthy {
-			status = "❌ UNHEALTHY"
+			status = "UNHEALTHY"
 		}
 
 		fmt.Printf("%d. %s\n", i+1, status)
 		fmt.Printf("   Time: %s\n", result.CheckedAt.Format("2006-01-02 15:04:05"))
-		fmt.Printf("   Status: %d | Response Time: %v\n", 
+		fmt.Printf("   Status: %d | Response Time: %v\n",
 			result.StatusCode, result.ResponseTime)
 
 		if result.Error != "" {
@@ -57,10 +63,9 @@ func main() {
 		fmt.Println()
 	}
 
-	// Calculate some basic statistics
 	var totalResponseTime int64
 	var healthyCount int
-	
+
 	for _, result := range results {
 		totalResponseTime += result.ResponseTime.Milliseconds()
 		if result.IsHealthy {
@@ -71,7 +76,7 @@ func main() {
 	avgResponseTime := totalResponseTime / int64(len(results))
 	uptime := (float64(healthyCount) / float64(len(results))) * 100
 
-	fmt.Printf("📈 Statistics:\n")
+	fmt.Printf("Statistics:\n")
 	fmt.Printf("   Average Response Time: %dms\n", avgResponseTime)
 	fmt.Printf("   Uptime: %.1f%% (%d/%d checks)\n", uptime, healthyCount, len(results))
 }

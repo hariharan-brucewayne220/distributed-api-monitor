@@ -26,7 +26,7 @@ func NewPostgresStore(connectionString string) (*PostgresStore, error) {
 	}
 
 	store := &PostgresStore{db: db}
-	
+
 	// Create tables if they don't exist
 	if err := store.createTables(); err != nil {
 		return nil, err
@@ -51,37 +51,48 @@ func (s *PostgresStore) createTables() error {
 	CREATE INDEX IF NOT EXISTS idx_check_results_url ON check_results(url);
 	CREATE INDEX IF NOT EXISTS idx_check_results_checked_at ON check_results(checked_at);
 	`
-	
+
 	_, err := s.db.Exec(query)
 	return err
 }
 
-// SaveResult saves a check result to the database
-func (s *PostgresStore) SaveResult(result checker.CheckResult) error {
-	query := `
+// Compile-time check that PostgresStore satisfies Store.
+var _ Store = (*PostgresStore)(nil)
+
+const insertResultSQL = `
 	INSERT INTO check_results (url, status_code, response_time_ms, is_healthy, error_message, checked_at)
 	VALUES ($1, $2, $3, $4, $5, $6)
 	`
-	
+
+// execer is satisfied by both *sql.DB and *sql.Tx.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func insertResult(e execer, result checker.CheckResult) error {
 	responseTimeMs := int(result.ResponseTime.Milliseconds())
 	var errorMessage *string
 	if result.Error != "" {
 		errorMessage = &result.Error
 	}
-	
-	_, err := s.db.Exec(query, 
-		result.URL, 
-		result.StatusCode, 
-		responseTimeMs, 
-		result.IsHealthy, 
-		errorMessage, 
+
+	_, err := e.Exec(insertResultSQL,
+		result.URL,
+		result.StatusCode,
+		responseTimeMs,
+		result.IsHealthy,
+		errorMessage,
 		result.CheckedAt,
 	)
-	
 	return err
 }
 
-// SaveResults saves multiple check results
+// SaveResult saves a single check result to the database
+func (s *PostgresStore) SaveResult(result checker.CheckResult) error {
+	return insertResult(s.db, result)
+}
+
+// SaveResults saves a batch of check results in one transaction.
 func (s *PostgresStore) SaveResults(results []checker.CheckResult) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -90,7 +101,7 @@ func (s *PostgresStore) SaveResults(results []checker.CheckResult) error {
 	defer tx.Rollback()
 
 	for _, result := range results {
-		if err := s.SaveResult(result); err != nil {
+		if err := insertResult(tx, result); err != nil {
 			return err
 		}
 	}
@@ -107,7 +118,7 @@ func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.Check
 	ORDER BY checked_at DESC 
 	LIMIT $2
 	`
-	
+
 	rows, err := s.db.Query(query, url, limit)
 	if err != nil {
 		return nil, err
@@ -119,7 +130,7 @@ func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.Check
 		var result checker.CheckResult
 		var responseTimeMs int
 		var errorMessage sql.NullString
-		
+
 		err := rows.Scan(
 			&result.URL,
 			&result.StatusCode,
@@ -131,15 +142,15 @@ func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.Check
 		if err != nil {
 			return nil, err
 		}
-		
+
 		result.ResponseTime = time.Duration(responseTimeMs) * time.Millisecond
 		if errorMessage.Valid {
 			result.Error = errorMessage.String
 		}
-		
+
 		results = append(results, result)
 	}
-	
+
 	return results, rows.Err()
 }
 

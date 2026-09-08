@@ -7,76 +7,75 @@ import (
 	"time"
 
 	"api-monitor/internal/checker"
+	"api-monitor/internal/config"
 	"api-monitor/internal/storage"
 )
 
+// monitor is the headless polling loop: it checks the default endpoints every
+// CHECK_INTERVAL and prints the results. Pass -db (or set DATABASE_URL) to
+// also write each batch to Postgres, using the same storage package as the
+// web server.
 func main() {
-	// Command line flags
-	useDB := flag.Bool("db", false, "Use database storage")
+	useDB := flag.Bool("db", false, "Persist results to Postgres (DATABASE_URL, or the docker-compose default)")
 	flag.Parse()
 
-	fmt.Println("🚀 Starting API Monitor...")
-	
-	// Create checker with 5 second timeout
-	httpChecker := checker.NewHTTPChecker(5 * time.Second)
-	
-	// Setup database if requested
-	var store *storage.PostgresStore
-	if *useDB {
-		fmt.Println("📊 Connecting to database...")
-		connectionString := "host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"
-		
-		var err error
-		store, err = storage.NewPostgresStore(connectionString)
+	cfg := config.Load()
+
+	fmt.Println("Starting API Monitor...")
+
+	httpChecker := checker.NewHTTPChecker(cfg.RequestTimeout)
+
+	var store storage.Store
+	if *useDB || cfg.DatabaseURL != "" {
+		dsn := cfg.DatabaseURL
+		if dsn == "" {
+			dsn = config.DefaultLocalDatabaseURL
+		}
+		fmt.Println("Connecting to database...")
+		pg, err := storage.NewPostgresStore(dsn)
 		if err != nil {
 			log.Fatalf("Failed to connect to database: %v", err)
 		}
-		defer store.Close()
-		fmt.Println("✅ Database connected!")
+		defer pg.Close()
+		store = pg
+		fmt.Println("Database connected; results will be persisted")
+	} else {
+		fmt.Println("DATABASE_URL not set and -db not given: results are printed only")
 	}
-	
-	// URLs to monitor (we'll start with public APIs)
-	urls := []string{
-		"https://api.github.com/users/octocat",
-		"https://jsonplaceholder.typicode.com/posts/1", 
-		"https://httpbin.org/status/200",
-		"https://httpbin.org/delay/2", // Reduced to 2 seconds
-	}
-	
-	fmt.Printf("📡 Monitoring %d endpoints...\n\n", len(urls))
-	
-	// Run checks every 15 seconds
+
+	urls := config.DefaultEndpoints()
+	fmt.Printf("Monitoring %d endpoints every %v\n\n", len(urls), cfg.CheckInterval)
+
 	for {
 		results := httpChecker.CheckMultiple(urls)
-		
-		// Save to database if enabled
+
 		if store != nil {
 			if err := store.SaveResults(results); err != nil {
 				log.Printf("Failed to save results: %v", err)
 			} else {
-				fmt.Println("💾 Results saved to database")
+				fmt.Println("Results saved to database")
 			}
 		}
-		
+
 		fmt.Printf("=== Check Results at %s ===\n", time.Now().Format("15:04:05"))
-		
+
 		for _, result := range results {
 			status := "HEALTHY"
 			if !result.IsHealthy {
 				status = "UNHEALTHY"
 			}
-			
+
 			fmt.Printf("%s %s\n", status, result.URL)
-			fmt.Printf("   Status: %d | Response Time: %v\n", 
+			fmt.Printf("   Status: %d | Response Time: %v\n",
 				result.StatusCode, result.ResponseTime.Round(time.Millisecond))
-			
+
 			if result.Error != "" {
 				fmt.Printf("   Error: %s\n", result.Error)
 			}
 			fmt.Println()
 		}
-		
-		fmt.Println("💤 Waiting 15 seconds...\n")
-		time.Sleep(15 * time.Second)
+
+		fmt.Printf("Waiting %v...\n\n", cfg.CheckInterval)
+		time.Sleep(cfg.CheckInterval)
 	}
 }

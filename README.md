@@ -1,133 +1,119 @@
-# 🚀 API Monitor
+# API Monitor
 
-A distributed API monitoring system built with Go, featuring real-time web dashboard and AI-powered insights using OpenAI's GPT-OSS model.
+A concurrent HTTP API monitor written in Go, with a web dashboard, optional
+Postgres history, and natural-language "insights" from a local
+OpenAI-compatible LLM (or a rule-based fallback when no model is running).
 
-## ✨ Features
+## Features
 
-- **Real-time Monitoring**: Concurrent HTTP endpoint health checks
-- **Web Dashboard**: Beautiful, responsive interface with live updates
-- **AI-Powered Insights**: Intelligent analysis using GPT-OSS model
-- **PostgreSQL Storage**: Persistent historical data
-- **gRPC Services**: Scalable microservices architecture
-- **Docker Ready**: Easy deployment with Docker Compose
-- **Configurable**: Environment-based configuration
+- **Concurrent checks** - every monitored URL is checked in parallel
+  (goroutines + `sync.WaitGroup`) with a configurable timeout
+- **Web dashboard** - live status cards, a per-endpoint response-time chart
+  seeded from history, add/remove endpoints from the page
+- **Optional Postgres history** - set `DATABASE_URL` and every check batch is
+  written to a `check_results` table; `GET /api/history` reads it back.
+  Without `DATABASE_URL`, results are kept in memory for the life of the
+  process and a log line says persistence is off
+- **AI insights** - `internal/ai` posts the current results to
+  `{AI_BASE_URL}/v1/chat/completions` and parses a JSON list of insights;
+  on any error (or `AI_ENABLED=false`) it falls back to rule-based insights
+- **Docker Compose** - `docker-compose.yml` runs Postgres + the dashboard with
+  persistence on; `docker-compose.ai.yml` adds a local GGUF model server
 
-## 🏗️ Architecture
+## Layout
 
 ```
-┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   HTTP Checker  │───▶│  Web Server  │───▶│  Web Dashboard  │
-└─────────────────┘    └──────────────┘    └─────────────────┘
-         │                       │                    │
-         ▼                       ▼                    ▼
-┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   PostgreSQL    │    │  GPT-OSS AI  │    │  Real-time UI   │
-└─────────────────┘    └──────────────┘    └─────────────────┘
+cmd/web       dashboard + JSON API (the main binary)
+cmd/monitor   headless polling loop that prints results (and persists with -db)
+cmd/query     prints recent stored results for one URL
+cmd/mock-ai   fake OpenAI-compatible server for demos
+internal/checker   HTTP checks (Check, CheckMultiple)
+internal/storage   Store interface, PostgresStore, MemoryStore
+internal/ai        OpenAI-compatible client + rule-based FallbackInsights
+internal/config    env-based configuration
+gguf_server.py     Flask + llama-cpp-python OpenAI-compatible shim (Dockerfile.gguf)
 ```
 
-## 🚀 Quick Start
+## Quick start
 
-### 🎯 Demo Mode (Recommended)
+### Demo (mock AI, in-memory history)
+
 ```bash
-# One-command demo with AI
-./demo.sh
+./demo.sh            # starts cmd/mock-ai on :8000 and cmd/web on :8080
 ```
-Then open http://localhost:8080
 
-### Option 1: Basic Setup (No AI)
+Open http://localhost:8080.
+
+### Dashboard with Postgres history
+
 ```bash
-# Start database
 docker-compose up -d postgres
-
-# Run web dashboard
-go run cmd/web/main.go
+export DATABASE_URL="host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"
+go run ./cmd/web
 ```
 
-### Option 2: Manual AI Setup
-```bash
-# Start mock AI server
-go run cmd/mock-ai/main.go &
+Or run everything in containers (persistence is on by default):
 
-# Run with AI enabled
-export AI_ENABLED=true
-export AI_BASE_URL=http://localhost:8000
-go run cmd/web/main.go
+```bash
+docker-compose up --build
 ```
 
-### Option 3: Local GGUF Model (Recommended)
+### Headless monitor and query CLIs
+
 ```bash
-# Use local GGUF model from shared directory (fast, efficient)
+go run ./cmd/monitor            # print checks every CHECK_INTERVAL
+go run ./cmd/monitor -db        # also persist (DATABASE_URL or compose defaults)
+go run ./cmd/query -url https://httpbin.org/status/200 -limit 20
+```
+
+### Local GGUF model
+
+```bash
+docker-compose -f docker-compose.ai.yml up      # Postgres + GGUF server + dashboard
+# or, without Docker:
 ./scripts/setup-local-gguf.sh
 ```
 
-### Option 4: Full GPT-OSS Model
-```bash
-# Real GPT-OSS model (requires GPU/lots of RAM)
-./scripts/setup-gpt-oss.sh
+## API
 
-# Or use Docker
-docker-compose -f docker-compose.ai.yml up
-```
+| Route | Description |
+| --- | --- |
+| `GET /` | Dashboard |
+| `GET /api/status` | Check all endpoints now; returns the batch (and persists it) |
+| `GET /api/history?endpoint=<url>&limit=N` | Most recent stored results for one endpoint, newest first (default 50, max 1000) |
+| `GET /api/insights` | Insights for the current batch (AI when configured, rule-based otherwise) |
+| `GET` / `POST` / `DELETE /api/endpoints` | List, add (`{"url": ...}`), or remove a monitored URL |
 
-## 🌐 Web Dashboard
+`responseTime` values are Go durations in nanoseconds.
 
-Access the dashboard at: http://localhost:8080
-
-- **Real-time status** of all monitored endpoints
-- **Response time charts** with historical data  
-- **AI insights** powered by GPT-OSS
-- **Health metrics** and uptime statistics
-
-## 🤖 AI Integration
-
-The system uses **GPT-OSS-20B** model for intelligent monitoring insights:
-
-- **Anomaly detection** in response patterns
-- **Performance trend analysis**
-- **Proactive recommendations**
-- **Natural language summaries** of system health
-
-## 📊 API Endpoints
-
-- `GET /` - Web dashboard
-- `GET /api/status` - Current endpoint status (JSON)
-- `GET /api/insights` - AI-powered insights (JSON)
-
-## ⚙️ Configuration
-
-Environment variables:
+## Configuration
 
 ```bash
-# Database
+# Persistence (unset = in-memory only)
 DATABASE_URL="host=localhost port=5432 user=monitor password=password dbname=api_monitor sslmode=disable"
 
 # Monitoring
-CHECK_INTERVAL="15s"
+CHECK_INTERVAL="15s"      # cmd/monitor polling interval
 REQUEST_TIMEOUT="5s"
 WEB_PORT=8080
 
-# AI (GPT-OSS)
+# AI (any OpenAI-compatible chat/completions server)
 AI_ENABLED=true
 AI_BASE_URL="http://localhost:8000"
 AI_API_KEY="your-api-key"
 AI_MODEL="gpt-oss-20b"
 ```
 
-## 🐳 Docker Setup
+## Development
 
 ```bash
-# Basic setup
-docker-compose up
-
-# With AI capabilities
-docker-compose -f docker-compose.ai.yml up
+go build ./...
+go vet ./...
+go test ./...
 ```
 
-## 💡 Demo Features
-
-Perfect for showcasing:
-- **Modern Go architecture** with clean separation
-- **AI integration** with OpenAI's latest open-source model
-- **Real-time web interfaces** with WebSocket-like updates
-- **Concurrent monitoring** demonstrating Go's strengths
-- **Container orchestration** with multi-service setup
+Tests cover the checker (httptest servers for 200 / 500 / timeout and
+concurrency), the AI client (fake OpenAI server, error fallback), the in-memory
+store, and the `/api/status`, `/api/history`, `/api/insights` and
+`/api/endpoints` handlers. `PostgresStore` is exercised only against a live
+database.

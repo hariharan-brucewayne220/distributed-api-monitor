@@ -265,6 +265,9 @@
             constructor() {
                 this.endpoints = [];
                 this.chart = null;
+                this.historyLoaded = new Set(); // URLs whose stored history has been drawn
+                this.maxPoints = 30;
+                this.palette = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'];
                 this.initChart();
                 this.loadData();
                 setInterval(() => this.loadData(), 5000); // Refresh every 5 seconds
@@ -275,8 +278,9 @@
                     // Load real data from API
                     const response = await fetch('/api/status');
                     const data = await response.json();
-                    
+
                     this.updateDashboard(data);
+                    await this.loadHistory(data.map(d => d.url));
                     this.updateChart(data);
                     await this.loadAIInsights();
                 } catch (error) {
@@ -371,34 +375,36 @@
 
             initChart() {
                 const ctx = document.getElementById('responseTimeChart').getContext('2d');
+                // One dataset per endpoint; points are {x: epoch ms, y: response ms}
+                // on a linear axis so no date adapter is needed.
                 this.chart = new Chart(ctx, {
                     type: 'line',
-                    data: {
-                        labels: [],
-                        datasets: [{
-                            label: 'Response Time (ms)',
-                            data: [],
-                            borderColor: '#3b82f6',
-                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                            fill: true,
-                            tension: 0.4
-                        }]
-                    },
+                    data: { datasets: [] },
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
+                        animation: false,
+                        parsing: false,
+                        plugins: {
+                            legend: { position: 'bottom' },
+                            tooltip: {
+                                callbacks: {
+                                    title: items => new Date(items[0].parsed.x).toLocaleTimeString(),
+                                    label: item => `${item.dataset.label}: ${Math.round(item.parsed.y)}ms`
+                                }
+                            }
+                        },
                         scales: {
                             y: {
                                 beginAtZero: true,
-                                title: {
-                                    display: true,
-                                    text: 'Response Time (ms)'
-                                }
+                                title: { display: true, text: 'Response Time (ms)' }
                             },
                             x: {
-                                title: {
-                                    display: true,
-                                    text: 'Time'
+                                type: 'linear',
+                                title: { display: true, text: 'Time' },
+                                ticks: {
+                                    maxTicksLimit: 8,
+                                    callback: v => new Date(v).toLocaleTimeString()
                                 }
                             }
                         }
@@ -406,18 +412,66 @@
                 });
             }
 
+            datasetFor(url) {
+                let ds = this.chart.data.datasets.find(d => d.label === url);
+                if (!ds) {
+                    const color = this.palette[this.chart.data.datasets.length % this.palette.length];
+                    ds = {
+                        label: url,
+                        data: [],
+                        borderColor: color,
+                        backgroundColor: color,
+                        fill: false,
+                        tension: 0.3,
+                        pointRadius: 2
+                    };
+                    this.chart.data.datasets.push(ds);
+                }
+                return ds;
+            }
+
+            // Seed each endpoint's dataset from /api/history the first time it is seen,
+            // so the chart shows stored results (Postgres or in-memory) rather than
+            // starting empty on every page load.
+            async loadHistory(urls) {
+                const pending = urls.filter(u => !this.historyLoaded.has(u));
+                if (pending.length === 0) return;
+
+                await Promise.all(pending.map(async url => {
+                    this.historyLoaded.add(url);
+                    try {
+                        const res = await fetch(`/api/history?endpoint=${encodeURIComponent(url)}&limit=${this.maxPoints}`);
+                        if (!res.ok) return;
+                        const body = await res.json();
+                        const ds = this.datasetFor(url);
+                        // API returns newest first; chart wants oldest first.
+                        ds.data = body.results.slice().reverse().map(r => ({
+                            x: new Date(r.lastChecked).getTime(),
+                            y: r.responseTime / 1000000
+                        }));
+                    } catch (err) {
+                        console.error('Failed to load history for', url, err);
+                    }
+                }));
+            }
+
             updateChart(data) {
-                const now = new Date().toLocaleTimeString();
-                // Convert nanoseconds to milliseconds
-                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime / 1000000, 0) / data.length;
+                const live = new Set(data.map(d => d.url));
+                // Drop datasets for endpoints that were removed.
+                this.chart.data.datasets = this.chart.data.datasets.filter(ds => live.has(ds.label));
 
-                this.chart.data.labels.push(now);
-                this.chart.data.datasets[0].data.push(avgResponseTime);
-
-                // Keep only last 10 data points
-                if (this.chart.data.labels.length > 10) {
-                    this.chart.data.labels.shift();
-                    this.chart.data.datasets[0].data.shift();
+                for (const d of data) {
+                    const ds = this.datasetFor(d.url);
+                    const x = new Date(d.lastChecked).getTime();
+                    // /api/history may already contain this exact check (it was
+                    // persisted by the same /api/status call); skip duplicates.
+                    const last = ds.data[ds.data.length - 1];
+                    if (!last || last.x !== x) {
+                        ds.data.push({ x, y: d.responseTime / 1000000 });
+                    }
+                    if (ds.data.length > this.maxPoints) {
+                        ds.data.splice(0, ds.data.length - this.maxPoints);
+                    }
                 }
 
                 this.chart.update();
