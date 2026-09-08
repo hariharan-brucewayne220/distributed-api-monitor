@@ -84,7 +84,10 @@ docker-compose -f docker-compose.ai.yml up      # Postgres + GGUF server + dashb
 | `GET /api/insights` | Insights for the current batch (AI when configured, rule-based otherwise) |
 | `GET` / `POST` / `DELETE /api/endpoints` | List, add (`{"url": ...}`), or remove a monitored URL |
 
-`responseTime` values are Go durations in nanoseconds.
+`responseTime` values are Go durations in nanoseconds. Added URLs must be
+`http(s)` and at most 2000 characters. The monitored URL list itself lives in
+memory: it resets to the defaults when the process restarts, while the stored
+history does not.
 
 ## Configuration
 
@@ -115,5 +118,24 @@ go test ./...
 Tests cover the checker (httptest servers for 200 / 500 / timeout and
 concurrency), the AI client (fake OpenAI server, error fallback), the in-memory
 store, and the `/api/status`, `/api/history`, `/api/insights` and
-`/api/endpoints` handlers. `PostgresStore` is exercised only against a live
-database.
+`/api/endpoints` handlers.
+
+`PostgresStore` needs a live database, so its tests are skipped unless
+`TEST_DATABASE_URL` is set. They run in a throwaway schema and cover the
+timestamp round-trip, batch writes containing a long URL, ordering under tied
+timestamps, and the in-place migration of a table created by the older schema:
+
+```bash
+docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:15
+TEST_DATABASE_URL="host=localhost port=5432 user=postgres password=pw dbname=postgres sslmode=disable" \
+  go test ./internal/storage -run Postgres -v
+```
+
+### Schema notes
+
+`check_results.checked_at` is `TIMESTAMPTZ` and `url` is `TEXT`. A naive
+`TIMESTAMP` column drops the writer's UTC offset and hands the value back
+labelled UTC, shifting every timestamp by the local offset; a bounded
+`VARCHAR(n)` lets one over-length URL abort the batch transaction and discard
+every other endpoint's result. A table created by an earlier version is altered
+to these types on startup.

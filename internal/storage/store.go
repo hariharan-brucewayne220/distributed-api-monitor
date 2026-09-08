@@ -6,6 +6,12 @@ import (
 	"api-monitor/internal/checker"
 )
 
+// MaxURLLength bounds the URLs callers may hand to a Store. The url column is
+// TEXT and imposes no limit of its own, but it is indexed, and a Postgres
+// btree entry cannot exceed roughly 2704 bytes; refusing longer URLs at the
+// edge keeps an unusable URL from failing the INSERT for a whole batch.
+const MaxURLLength = 2000
+
 // Store is the persistence contract shared by the web server, the monitor
 // CLI and the query CLI. PostgresStore implements it against a database;
 // MemoryStore implements it in-process for when no DATABASE_URL is set.

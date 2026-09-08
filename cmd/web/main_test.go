@@ -221,6 +221,13 @@ func TestEndpoints_AddRemoveAffectsStatus(t *testing.T) {
 	if rec := post(http.MethodPost, `{"url":"ftp://nope"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad scheme add = %d, want 400", rec.Code)
 	}
+	// An over-length URL has to be refused here: SaveResults writes a batch in
+	// one transaction, so a URL the store cannot hold would take every other
+	// endpoint's result down with it.
+	tooLong := "http://example.test/?pad=" + strings.Repeat("z", storage.MaxURLLength)
+	if rec := post(http.MethodPost, `{"url":"`+tooLong+`"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("over-length add = %d, want 400", rec.Code)
+	}
 
 	var statuses []EndpointStatus
 	if err := json.Unmarshal(get(t, h, "/api/status").Body.Bytes(), &statuses); err != nil {

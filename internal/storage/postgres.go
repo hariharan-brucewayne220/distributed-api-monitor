@@ -32,20 +32,34 @@ func NewPostgresStore(connectionString string) (*PostgresStore, error) {
 		return nil, err
 	}
 
+	// Bring a pre-existing table up to the current column types.
+	if err := store.migrateSchema(); err != nil {
+		return nil, err
+	}
+
 	return store, nil
 }
 
-// createTables creates the necessary database tables
+// createTables creates the necessary database tables.
+//
+// checked_at is TIMESTAMPTZ, not TIMESTAMP: CheckResult.CheckedAt is a
+// wall-clock instant in the process's local zone, and a naive TIMESTAMP column
+// silently discards the UTC offset on write and hands the value back labelled
+// UTC on read, shifting every timestamp by the local offset.
+//
+// url is TEXT rather than VARCHAR(n) because SaveResults writes a whole batch
+// in one transaction: a single over-length URL would abort the transaction and
+// discard the results for every other endpoint in that batch.
 func (s *PostgresStore) createTables() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS check_results (
 		id SERIAL PRIMARY KEY,
-		url VARCHAR(500) NOT NULL,
+		url TEXT NOT NULL,
 		status_code INTEGER,
 		response_time_ms INTEGER NOT NULL,
 		is_healthy BOOLEAN NOT NULL,
 		error_message TEXT,
-		checked_at TIMESTAMP NOT NULL DEFAULT NOW()
+		checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_check_results_url ON check_results(url);
@@ -54,6 +68,43 @@ func (s *PostgresStore) createTables() error {
 
 	_, err := s.db.Exec(query)
 	return err
+}
+
+// migrateSchema upgrades a check_results table created by an earlier version
+// to the column types createTables now produces. It is a no-op once the table
+// is current, so it is safe to run on every startup.
+func (s *PostgresStore) migrateSchema() error {
+	var urlType, checkedAtType sql.NullString
+	err := s.db.QueryRow(`
+	SELECT
+		max(CASE WHEN column_name = 'url' THEN data_type END),
+		max(CASE WHEN column_name = 'checked_at' THEN data_type END)
+	FROM information_schema.columns
+	WHERE table_schema = current_schema() AND table_name = 'check_results'
+	`).Scan(&urlType, &checkedAtType)
+	if err != nil {
+		return err
+	}
+
+	if urlType.String == "character varying" {
+		if _, err := s.db.Exec(`ALTER TABLE check_results ALTER COLUMN url TYPE TEXT`); err != nil {
+			return err
+		}
+	}
+
+	if checkedAtType.String == "timestamp without time zone" {
+		// Rows already in the table were written by a build that dropped the
+		// offset, and GetRecentResults has been reading them back as UTC.
+		// Interpreting them as UTC keeps existing history reading exactly as it
+		// did before the upgrade; only new rows get a true instant.
+		if _, err := s.db.Exec(
+			`ALTER TABLE check_results ALTER COLUMN checked_at TYPE TIMESTAMPTZ USING checked_at AT TIME ZONE 'UTC'`,
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Compile-time check that PostgresStore satisfies Store.
@@ -109,13 +160,17 @@ func (s *PostgresStore) SaveResults(results []checker.CheckResult) error {
 	return tx.Commit()
 }
 
-// GetRecentResults gets recent results for a URL
+// GetRecentResults gets recent results for a URL, newest first.
+//
+// id breaks ties on checked_at: the clock backing CheckedAt is coarse enough
+// on some platforms (~15ms on Windows) for two checks to land on the same
+// timestamp, and without a tiebreak "newest first" is not deterministic.
 func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.CheckResult, error) {
 	query := `
 	SELECT url, status_code, response_time_ms, is_healthy, error_message, checked_at
-	FROM check_results 
-	WHERE url = $1 
-	ORDER BY checked_at DESC 
+	FROM check_results
+	WHERE url = $1
+	ORDER BY checked_at DESC, id DESC
 	LIMIT $2
 	`
 

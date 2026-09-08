@@ -240,6 +240,13 @@ func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "URL must start with http:// or https://", http.StatusBadRequest)
 			return
 		}
+		// Reject here rather than at INSERT time: SaveResults writes a batch in
+		// one transaction, so a URL the store cannot hold would discard the
+		// results for every other endpoint checked alongside it.
+		if len(url) > storage.MaxURLLength {
+			http.Error(w, fmt.Sprintf("URL must be at most %d characters", storage.MaxURLLength), http.StatusBadRequest)
+			return
+		}
 
 		ws.urlsMutex.Lock()
 		for _, existingURL := range ws.urls {
