@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15
@@ -17,15 +15,33 @@ services:
       timeout: 5s
       retries: 5
 
-  # Web dashboard + JSON API. DATABASE_URL turns on Postgres persistence, so
-  # /api/history survives restarts. AI insights are rule-based unless you point
-  # AI_BASE_URL at an OpenAI-compatible server (see docker-compose.ai.yml).
+  # Check workers. Each replica leases due endpoints from Postgres, so the
+  # checks are split between them and a stopped replica's endpoints move to the
+  # others once its leases expire. Scale with: docker compose up --scale worker=5
+  worker:
+    build: .
+    command: ["./monitor", "-quiet"]
+    environment:
+      - DATABASE_URL=host=postgres port=5432 user=monitor password=password dbname=api_monitor sslmode=disable
+      - WORKER_REGION=${WORKER_REGION:-local}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-15s}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+
+  # Web dashboard + JSON API. It reads what the workers record and does not run
+  # checks itself (EMBEDDED_WORKER=false). AI insights are rule-based unless you
+  # point AI_BASE_URL at an OpenAI-compatible server (see docker-compose.ai.yml).
   api-monitor:
     build: .
     ports:
       - "8080:8080"
     environment:
       - DATABASE_URL=host=postgres port=5432 user=monitor password=password dbname=api_monitor sslmode=disable
+      - EMBEDDED_WORKER=false
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-15s}
       - AI_ENABLED=${AI_ENABLED:-false}
       - AI_BASE_URL=${AI_BASE_URL:-http://host.docker.internal:8000}
       - AI_API_KEY=${AI_API_KEY:-demo-key}

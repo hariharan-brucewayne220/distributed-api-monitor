@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -14,6 +15,9 @@ type CheckResult struct {
 	IsHealthy    bool          `json:"is_healthy"`
 	Error        string        `json:"error,omitempty"`
 	CheckedAt    time.Time     `json:"checked_at"`
+	// WorkerID names the worker process that ran the check. It is empty for
+	// checks run outside the coordinated worker loop.
+	WorkerID string `json:"worker_id,omitempty"`
 }
 
 // HTTPChecker performs HTTP health checks
@@ -50,6 +54,9 @@ func (c *HTTPChecker) Check(url string) CheckResult {
 		return result
 	}
 	defer resp.Body.Close()
+	// Drain (a bounded amount of) the body so the keep-alive connection can be
+	// reused by the next check of the same host.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 
 	result.StatusCode = resp.StatusCode
 	// Consider 2xx status codes as healthy

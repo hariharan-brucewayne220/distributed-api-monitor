@@ -19,7 +19,16 @@ type Config struct {
 	// Monitoring configuration
 	CheckInterval  time.Duration
 	RequestTimeout time.Duration
+	// MaxConcurrency is the most endpoints one worker leases (and checks
+	// concurrently) per round.
 	MaxConcurrency int
+
+	// Worker configuration
+	WorkerID       string // empty = hostname-pid-random
+	WorkerRegion   string
+	LeaseDuration  time.Duration
+	PollInterval   time.Duration
+	EmbeddedWorker bool // run a worker inside cmd/web
 
 	// Web server configuration
 	WebPort int
@@ -29,43 +38,40 @@ type Config struct {
 	AIBaseURL string
 	AIAPIKey  string
 	AIModel   string
-
-	// Alerting configuration
-	AlertingEnabled bool
-	SlackWebhook    string
-	EmailSMTPHost   string
-	EmailSMTPPort   int
-	EmailUsername   string
-	EmailPassword   string
+	// InsightsTTL is how long /api/insights reuses one answer, so a dashboard
+	// polling every few seconds does not issue an LLM call per poll.
+	InsightsTTL time.Duration
 }
 
 // Load loads configuration from environment variables with defaults
 func Load() *Config {
+	requestTimeout := getDuration("REQUEST_TIMEOUT", 5*time.Second)
 	return &Config{
 		// Database
 		DatabaseURL: getEnv("DATABASE_URL", ""),
 
 		// Monitoring
 		CheckInterval:  getDuration("CHECK_INTERVAL", 15*time.Second),
-		RequestTimeout: getDuration("REQUEST_TIMEOUT", 5*time.Second),
+		RequestTimeout: requestTimeout,
 		MaxConcurrency: getInt("MAX_CONCURRENCY", 10),
+
+		// Workers. The default lease leaves room for a full request timeout
+		// plus the round trip to record the result.
+		WorkerID:       getEnv("WORKER_ID", ""),
+		WorkerRegion:   getEnv("WORKER_REGION", "local"),
+		LeaseDuration:  getDuration("LEASE_DURATION", 2*requestTimeout+10*time.Second),
+		PollInterval:   getDuration("POLL_INTERVAL", time.Second),
+		EmbeddedWorker: getBool("EMBEDDED_WORKER", true),
 
 		// Web server
 		WebPort: getInt("WEB_PORT", 8080),
 
 		// AI configuration (GPT-OSS)
-		AIEnabled: getBool("AI_ENABLED", true),
-		AIBaseURL: getEnv("AI_BASE_URL", "http://localhost:8000"), // Local GPT-OSS server
-		AIAPIKey:  getEnv("AI_API_KEY", "your-api-key-here"),
-		AIModel:   getEnv("AI_MODEL", "gpt-oss-20b"),
-
-		// Alerting
-		AlertingEnabled: getBool("ALERTING_ENABLED", false),
-		SlackWebhook:    getEnv("SLACK_WEBHOOK", ""),
-		EmailSMTPHost:   getEnv("EMAIL_SMTP_HOST", "smtp.gmail.com"),
-		EmailSMTPPort:   getInt("EMAIL_SMTP_PORT", 587),
-		EmailUsername:   getEnv("EMAIL_USERNAME", ""),
-		EmailPassword:   getEnv("EMAIL_PASSWORD", ""),
+		AIEnabled:   getBool("AI_ENABLED", true),
+		AIBaseURL:   getEnv("AI_BASE_URL", "http://localhost:8000"), // Local GPT-OSS server
+		AIAPIKey:    getEnv("AI_API_KEY", "your-api-key-here"),
+		AIModel:     getEnv("AI_MODEL", "gpt-oss-20b"),
+		InsightsTTL: getDuration("INSIGHTS_TTL", 30*time.Second),
 	}
 }
 

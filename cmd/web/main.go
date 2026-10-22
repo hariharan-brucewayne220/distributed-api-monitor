@@ -3,35 +3,46 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"api-monitor/internal/ai"
 	"api-monitor/internal/checker"
 	"api-monitor/internal/config"
 	"api-monitor/internal/storage"
+	"api-monitor/internal/worker"
 )
 
 const (
 	defaultHistoryLimit = 50
 	maxHistoryLimit     = 1000
+
+	// workerStaleAfter is how long since its last heartbeat a worker is still
+	// reported alive. It allows for a heartbeat delayed by a slow batch.
+	workerStaleAfter = 30 * time.Second
 )
 
-// WebServer serves the dashboard and JSON API. Every batch of checks it runs
-// is written to store, which is Postgres when DATABASE_URL is set and an
-// in-process ring buffer otherwise.
+// WebServer serves the dashboard and JSON API. It never runs checks itself:
+// workers (embedded in this process, or separate cmd/monitor processes) write
+// results to the coordinator, and the API reads them back. That keeps the load
+// on monitored endpoints independent of how many dashboards are open and how
+// many web replicas are running.
 type WebServer struct {
-	checker   *checker.HTTPChecker
-	aiClient  *ai.GPTOSSClient
-	store     storage.Store
-	urls      []string
-	urlsMutex sync.RWMutex
-	config    *config.Config
+	aiClient *ai.GPTOSSClient
+	coord    storage.Coordinator
+	config   *config.Config
+
+	insightsMu  sync.Mutex
+	insightsAt  time.Time
+	insightsVal []ai.Insight
 }
 
 // EndpointStatus is the JSON shape used by /api/status and /api/history.
@@ -42,6 +53,17 @@ type EndpointStatus struct {
 	ResponseTime time.Duration `json:"responseTime"`
 	LastChecked  time.Time     `json:"lastChecked"`
 	Error        string        `json:"error,omitempty"`
+	CheckedBy    string        `json:"checkedBy,omitempty"`
+}
+
+// WorkerStatus is the JSON shape returned by /api/workers.
+type WorkerStatus struct {
+	ID             string    `json:"id"`
+	Region         string    `json:"region"`
+	StartedAt      time.Time `json:"startedAt"`
+	LastHeartbeat  time.Time `json:"lastHeartbeat"`
+	SinceHeartbeat float64   `json:"secondsSinceHeartbeat"`
+	Alive          bool      `json:"alive"`
 }
 
 // HistoryResponse is the JSON shape returned by /api/history.
@@ -57,13 +79,11 @@ type EndpointRequest struct {
 
 // NewWebServer wires a server from its collaborators. aiClient may be nil to
 // use rule-based insights only.
-func NewWebServer(cfg *config.Config, chk *checker.HTTPChecker, store storage.Store, aiClient *ai.GPTOSSClient, urls []string) *WebServer {
+func NewWebServer(cfg *config.Config, coord storage.Coordinator, aiClient *ai.GPTOSSClient) *WebServer {
 	return &WebServer{
-		checker:  chk,
 		aiClient: aiClient,
-		store:    store,
+		coord:    coord,
 		config:   cfg,
-		urls:     append([]string(nil), urls...),
 	}
 }
 
@@ -75,6 +95,7 @@ func (ws *WebServer) Handler() http.Handler {
 	mux.HandleFunc("/api/history", ws.handleHistory)
 	mux.HandleFunc("/api/insights", ws.handleAIInsights)
 	mux.HandleFunc("/api/endpoints", ws.handleEndpoints)
+	mux.HandleFunc("/api/workers", ws.handleWorkers)
 	return mux
 }
 
@@ -86,24 +107,8 @@ func toStatus(result checker.CheckResult) EndpointStatus {
 		ResponseTime: result.ResponseTime,
 		LastChecked:  result.CheckedAt,
 		Error:        result.Error,
+		CheckedBy:    result.WorkerID,
 	}
-}
-
-func (ws *WebServer) snapshotURLs() []string {
-	ws.urlsMutex.RLock()
-	defer ws.urlsMutex.RUnlock()
-	return append([]string(nil), ws.urls...)
-}
-
-// runChecks checks every monitored URL concurrently and persists the batch.
-func (ws *WebServer) runChecks() []checker.CheckResult {
-	results := ws.checker.CheckMultiple(ws.snapshotURLs())
-	if len(results) > 0 {
-		if err := ws.store.SaveResults(results); err != nil {
-			log.Printf("failed to persist %d check results: %v", len(results), err)
-		}
-	}
-	return results
 }
 
 // setCORS applies the permissive CORS headers used by every JSON route and
@@ -130,7 +135,12 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := ws.runChecks()
+	results, err := ws.coord.LatestResults()
+	if err != nil {
+		log.Printf("latest results query failed: %v", err)
+		http.Error(w, "failed to read status", http.StatusInternalServerError)
+		return
+	}
 	statuses := make([]EndpointStatus, 0, len(results))
 	for _, result := range results {
 		statuses = append(statuses, toStatus(result))
@@ -168,7 +178,7 @@ func (ws *WebServer) handleHistory(w http.ResponseWriter, r *http.Request) {
 		limit = maxHistoryLimit
 	}
 
-	results, err := ws.store.GetRecentResults(endpoint, limit)
+	results, err := ws.coord.GetRecentResults(endpoint, limit)
 	if err != nil {
 		log.Printf("history query for %s failed: %v", endpoint, err)
 		http.Error(w, "failed to read history", http.StatusInternalServerError)
@@ -195,11 +205,35 @@ func (ws *WebServer) handleAIInsights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := ws.runChecks()
+	insights, err := ws.insights(r.Context())
+	if err != nil {
+		log.Printf("latest results query failed: %v", err)
+		http.Error(w, "failed to read status", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(insights)
+}
+
+// insights returns insights for the latest results, reusing the previous
+// answer for InsightsTTL. The lock is held while generating so that requests
+// arriving during a slow LLM call wait for its answer instead of each starting
+// their own.
+func (ws *WebServer) insights(ctx context.Context) ([]ai.Insight, error) {
+	ws.insightsMu.Lock()
+	defer ws.insightsMu.Unlock()
+
+	if ttl := ws.config.InsightsTTL; ttl > 0 && ws.insightsVal != nil && time.Since(ws.insightsAt) < ttl {
+		return ws.insightsVal, nil
+	}
+
+	results, err := ws.coord.LatestResults()
+	if err != nil {
+		return nil, err
+	}
 
 	var insights []ai.Insight
 	if ws.aiClient != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 
 		aiInsights, err := ws.aiClient.AnalyzeEndpoints(ctx, results)
@@ -212,7 +246,39 @@ func (ws *WebServer) handleAIInsights(w http.ResponseWriter, r *http.Request) {
 		insights = ai.FallbackInsights(results)
 	}
 
-	json.NewEncoder(w).Encode(insights)
+	ws.insightsVal, ws.insightsAt = insights, time.Now()
+	return insights, nil
+}
+
+// handleWorkers serves GET /api/workers: every worker that has sent a
+// heartbeat in the last hour, and whether it is still considered alive.
+func (ws *WebServer) handleWorkers(w http.ResponseWriter, r *http.Request) {
+	if setCORS(w, r, "GET, OPTIONS") {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	workers, err := ws.coord.ListWorkers()
+	if err != nil {
+		log.Printf("workers query failed: %v", err)
+		http.Error(w, "failed to read workers", http.StatusInternalServerError)
+		return
+	}
+	out := make([]WorkerStatus, 0, len(workers))
+	for _, wk := range workers {
+		out = append(out, WorkerStatus{
+			ID:             wk.ID,
+			Region:         wk.Region,
+			StartedAt:      wk.StartedAt,
+			LastHeartbeat:  wk.LastHeartbeat,
+			SinceHeartbeat: wk.SinceHeartbeat.Seconds(),
+			Alive:          wk.SinceHeartbeat < workerStaleAfter,
+		})
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
@@ -222,7 +288,13 @@ func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		json.NewEncoder(w).Encode(map[string][]string{"urls": ws.snapshotURLs()})
+		urls, err := ws.coord.ListEndpoints()
+		if err != nil {
+			log.Printf("list endpoints failed: %v", err)
+			http.Error(w, "failed to list endpoints", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string][]string{"urls": urls})
 
 	case http.MethodPost:
 		var req EndpointRequest
@@ -240,24 +312,23 @@ func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "URL must start with http:// or https://", http.StatusBadRequest)
 			return
 		}
-		// Reject here rather than at INSERT time: SaveResults writes a batch in
-		// one transaction, so a URL the store cannot hold would discard the
-		// results for every other endpoint checked alongside it.
+		// Reject here rather than at INSERT time: results are written in
+		// batches, one transaction each, so a URL the store cannot hold would
+		// discard the results for every other endpoint checked alongside it.
 		if len(url) > storage.MaxURLLength {
 			http.Error(w, fmt.Sprintf("URL must be at most %d characters", storage.MaxURLLength), http.StatusBadRequest)
 			return
 		}
 
-		ws.urlsMutex.Lock()
-		for _, existingURL := range ws.urls {
-			if existingURL == url {
-				ws.urlsMutex.Unlock()
+		if err := ws.coord.AddEndpoint(url, ws.config.CheckInterval); err != nil {
+			if errors.Is(err, storage.ErrEndpointExists) {
 				http.Error(w, "URL already being monitored", http.StatusConflict)
 				return
 			}
+			log.Printf("add endpoint %s failed: %v", url, err)
+			http.Error(w, "failed to add endpoint", http.StatusInternalServerError)
+			return
 		}
-		ws.urls = append(ws.urls, url)
-		ws.urlsMutex.Unlock()
 
 		log.Printf("Added endpoint: %s", url)
 		w.WriteHeader(http.StatusCreated)
@@ -276,19 +347,13 @@ func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		ws.urlsMutex.Lock()
-		found := false
-		for i, existingURL := range ws.urls {
-			if existingURL == url {
-				ws.urls = append(ws.urls[:i], ws.urls[i+1:]...)
-				found = true
-				break
+		if err := ws.coord.RemoveEndpoint(url); err != nil {
+			if errors.Is(err, storage.ErrEndpointNotFound) {
+				http.Error(w, "URL not found", http.StatusNotFound)
+				return
 			}
-		}
-		ws.urlsMutex.Unlock()
-
-		if !found {
-			http.Error(w, "URL not found", http.StatusNotFound)
+			log.Printf("remove endpoint %s failed: %v", url, err)
+			http.Error(w, "failed to remove endpoint", http.StatusInternalServerError)
 			return
 		}
 
@@ -300,45 +365,70 @@ func (ws *WebServer) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// openStore returns a Postgres-backed store when DATABASE_URL is set and an
-// in-memory store otherwise.
-func openStore(cfg *config.Config) (storage.Store, error) {
+// openCoordinator returns a Postgres-backed coordinator when DATABASE_URL is
+// set and an in-memory one otherwise.
+func openCoordinator(cfg *config.Config) (storage.Coordinator, error) {
 	if cfg.DatabaseURL == "" {
-		log.Printf("DATABASE_URL not set: persistence is off, history is kept in memory for this process only")
+		log.Printf("DATABASE_URL not set: single-process mode, endpoints and history are kept in memory for this process only")
 		return storage.NewMemoryStore(storage.DefaultMemoryCapacity), nil
 	}
 	store, err := storage.NewPostgresStore(cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to DATABASE_URL: %w", err)
 	}
-	log.Printf("persistence on: check results are written to Postgres")
+	log.Printf("cluster mode: endpoints, leases and results are shared through Postgres")
 	return store, nil
 }
 
 func main() {
 	cfg := config.Load()
 
-	store, err := openStore(cfg)
+	coord, err := openCoordinator(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer store.Close()
+	defer coord.Close()
+
+	if err := coord.SeedEndpoints(config.DefaultEndpoints(), cfg.CheckInterval); err != nil {
+		log.Fatalf("seed endpoints: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if cfg.EmbeddedWorker {
+		w := &worker.Worker{
+			ID:            cfg.WorkerID,
+			Region:        cfg.WorkerRegion,
+			Coord:         coord,
+			Checker:       checker.NewHTTPChecker(cfg.RequestTimeout),
+			BatchSize:     cfg.MaxConcurrency,
+			LeaseDuration: cfg.LeaseDuration,
+			PollInterval:  cfg.PollInterval,
+		}
+		go w.Run(ctx)
+	} else if cfg.DatabaseURL == "" {
+		log.Printf("warning: EMBEDDED_WORKER=false without DATABASE_URL means nothing will ever check the endpoints")
+	} else {
+		log.Printf("embedded worker off: relying on separate cmd/monitor workers")
+	}
 
 	var aiClient *ai.GPTOSSClient
 	if cfg.AIEnabled {
 		aiClient = ai.NewGPTOSSClient(cfg.AIBaseURL, cfg.AIAPIKey, cfg.AIModel)
 	}
 
-	ws := NewWebServer(cfg, checker.NewHTTPChecker(cfg.RequestTimeout), store, aiClient, config.DefaultEndpoints())
+	ws := NewWebServer(cfg, coord, aiClient)
 
 	port := cfg.WebPort
 	fmt.Printf("Web dashboard starting on http://localhost:%d\n", port)
 	fmt.Printf("API endpoints:\n")
 	fmt.Printf("   - GET /                 - Web dashboard\n")
-	fmt.Printf("   - GET /api/status       - Check all endpoints now\n")
+	fmt.Printf("   - GET /api/status       - Latest result per endpoint\n")
 	fmt.Printf("   - GET /api/history      - Recent results (?endpoint=<url>&limit=N)\n")
 	fmt.Printf("   - GET /api/insights     - AI-powered insights\n")
 	fmt.Printf("   - GET/POST/DELETE /api/endpoints - Manage monitored URLs\n")
+	fmt.Printf("   - GET /api/workers      - Workers and their heartbeats\n")
 
 	if aiClient != nil {
 		fmt.Printf("AI insights via %s (%s)\n", cfg.AIBaseURL, cfg.AIModel)
@@ -346,5 +436,14 @@ func main() {
 		fmt.Printf("Using rule-based insights (AI disabled)\n")
 	}
 
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), ws.Handler()))
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: ws.Handler()}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdownCtx)
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }

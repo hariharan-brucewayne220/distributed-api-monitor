@@ -5,14 +5,16 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o api-monitor ./cmd/web
+RUN CGO_ENABLED=0 GOOS=linux go build -o api-monitor ./cmd/web \
+ && CGO_ENABLED=0 GOOS=linux go build -o monitor ./cmd/monitor
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 
-COPY --from=builder /app/api-monitor .
+COPY --from=builder /app/api-monitor /app/monitor ./
 COPY --from=builder /app/web ./web
 
 EXPOSE 8080
+# The web server by default; the worker service in docker-compose.yml runs ./monitor.
 CMD ["./api-monitor"]

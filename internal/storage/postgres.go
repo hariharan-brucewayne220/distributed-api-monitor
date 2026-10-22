@@ -26,18 +26,38 @@ func NewPostgresStore(connectionString string) (*PostgresStore, error) {
 	}
 
 	store := &PostgresStore{db: db}
-
-	// Create tables if they don't exist
-	if err := store.createTables(); err != nil {
+	if err := store.setupSchema(); err != nil {
+		db.Close()
 		return nil, err
 	}
-
-	// Bring a pre-existing table up to the current column types.
-	if err := store.migrateSchema(); err != nil {
-		return nil, err
-	}
-
 	return store, nil
+}
+
+// schemaLockKey is the advisory lock that serializes schema setup.
+const schemaLockKey = 7_219_450_116
+
+// setupSchema creates and migrates the tables in one transaction holding an
+// advisory lock. Several workers starting at the same moment would otherwise
+// race on CREATE TABLE IF NOT EXISTS, which is not safe under concurrency in
+// Postgres (the loser fails on a pg_type unique violation).
+func (s *PostgresStore) setupSchema() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, schemaLockKey); err != nil {
+		return err
+	}
+	if err := createTables(tx); err != nil {
+		return err
+	}
+	// Bring a pre-existing table up to the current column types.
+	if err := migrateSchema(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // createTables creates the necessary database tables.
@@ -50,7 +70,11 @@ func NewPostgresStore(connectionString string) (*PostgresStore, error) {
 // url is TEXT rather than VARCHAR(n) because SaveResults writes a whole batch
 // in one transaction: a single over-length URL would abort the transaction and
 // discard the results for every other endpoint in that batch.
-func (s *PostgresStore) createTables() error {
+//
+// endpoints is the shared registry and work queue: next_check_at says when an
+// endpoint is due, lease_owner/lease_until say which worker holds it, and
+// lease_token is the fencing token that Complete checks.
+func createTables(tx *sql.Tx) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS check_results (
 		id SERIAL PRIMARY KEY,
@@ -59,23 +83,49 @@ func (s *PostgresStore) createTables() error {
 		response_time_ms INTEGER NOT NULL,
 		is_healthy BOOLEAN NOT NULL,
 		error_message TEXT,
-		checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		worker_id TEXT
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_check_results_url ON check_results(url);
 	CREATE INDEX IF NOT EXISTS idx_check_results_checked_at ON check_results(checked_at);
+
+	CREATE TABLE IF NOT EXISTS endpoints (
+		id BIGSERIAL PRIMARY KEY,
+		url TEXT NOT NULL UNIQUE,
+		interval_ms BIGINT NOT NULL,
+		next_check_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		lease_owner TEXT,
+		lease_until TIMESTAMPTZ,
+		lease_token BIGINT NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_endpoints_next_check_at ON endpoints(next_check_at);
+
+	CREATE TABLE IF NOT EXISTS workers (
+		id TEXT PRIMARY KEY,
+		region TEXT NOT NULL DEFAULT '',
+		started_at TIMESTAMPTZ NOT NULL,
+		last_heartbeat TIMESTAMPTZ NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS monitor_meta (
+		key TEXT PRIMARY KEY,
+		set_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
 	`
 
-	_, err := s.db.Exec(query)
+	_, err := tx.Exec(query)
 	return err
 }
 
 // migrateSchema upgrades a check_results table created by an earlier version
 // to the column types createTables now produces. It is a no-op once the table
 // is current, so it is safe to run on every startup.
-func (s *PostgresStore) migrateSchema() error {
+func migrateSchema(tx *sql.Tx) error {
 	var urlType, checkedAtType sql.NullString
-	err := s.db.QueryRow(`
+	err := tx.QueryRow(`
 	SELECT
 		max(CASE WHEN column_name = 'url' THEN data_type END),
 		max(CASE WHEN column_name = 'checked_at' THEN data_type END)
@@ -87,7 +137,7 @@ func (s *PostgresStore) migrateSchema() error {
 	}
 
 	if urlType.String == "character varying" {
-		if _, err := s.db.Exec(`ALTER TABLE check_results ALTER COLUMN url TYPE TEXT`); err != nil {
+		if _, err := tx.Exec(`ALTER TABLE check_results ALTER COLUMN url TYPE TEXT`); err != nil {
 			return err
 		}
 	}
@@ -97,22 +147,23 @@ func (s *PostgresStore) migrateSchema() error {
 		// offset, and GetRecentResults has been reading them back as UTC.
 		// Interpreting them as UTC keeps existing history reading exactly as it
 		// did before the upgrade; only new rows get a true instant.
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`ALTER TABLE check_results ALTER COLUMN checked_at TYPE TIMESTAMPTZ USING checked_at AT TIME ZONE 'UTC'`,
 		); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	_, err = tx.Exec(`ALTER TABLE check_results ADD COLUMN IF NOT EXISTS worker_id TEXT`)
+	return err
 }
 
 // Compile-time check that PostgresStore satisfies Store.
 var _ Store = (*PostgresStore)(nil)
 
 const insertResultSQL = `
-	INSERT INTO check_results (url, status_code, response_time_ms, is_healthy, error_message, checked_at)
-	VALUES ($1, $2, $3, $4, $5, $6)
+	INSERT INTO check_results (url, status_code, response_time_ms, is_healthy, error_message, checked_at, worker_id)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
 
 // execer is satisfied by both *sql.DB and *sql.Tx.
@@ -122,9 +173,12 @@ type execer interface {
 
 func insertResult(e execer, result checker.CheckResult) error {
 	responseTimeMs := int(result.ResponseTime.Milliseconds())
-	var errorMessage *string
+	var errorMessage, workerID *string
 	if result.Error != "" {
 		errorMessage = &result.Error
+	}
+	if result.WorkerID != "" {
+		workerID = &result.WorkerID
 	}
 
 	_, err := e.Exec(insertResultSQL,
@@ -134,6 +188,7 @@ func insertResult(e execer, result checker.CheckResult) error {
 		result.IsHealthy,
 		errorMessage,
 		result.CheckedAt,
+		workerID,
 	)
 	return err
 }
@@ -167,7 +222,7 @@ func (s *PostgresStore) SaveResults(results []checker.CheckResult) error {
 // timestamp, and without a tiebreak "newest first" is not deterministic.
 func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.CheckResult, error) {
 	query := `
-	SELECT url, status_code, response_time_ms, is_healthy, error_message, checked_at
+	SELECT ` + resultColumns + `
 	FROM check_results
 	WHERE url = $1
 	ORDER BY checked_at DESC, id DESC
@@ -178,13 +233,20 @@ func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.Check
 	if err != nil {
 		return nil, err
 	}
+	return scanResults(rows)
+}
+
+const resultColumns = `url, status_code, response_time_ms, is_healthy, error_message, checked_at, worker_id`
+
+// scanResults reads rows selected with resultColumns and closes them.
+func scanResults(rows *sql.Rows) ([]checker.CheckResult, error) {
 	defer rows.Close()
 
 	var results []checker.CheckResult
 	for rows.Next() {
 		var result checker.CheckResult
 		var responseTimeMs int
-		var errorMessage sql.NullString
+		var errorMessage, workerID sql.NullString
 
 		err := rows.Scan(
 			&result.URL,
@@ -193,15 +255,15 @@ func (s *PostgresStore) GetRecentResults(url string, limit int) ([]checker.Check
 			&result.IsHealthy,
 			&errorMessage,
 			&result.CheckedAt,
+			&workerID,
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		result.ResponseTime = time.Duration(responseTimeMs) * time.Millisecond
-		if errorMessage.Valid {
-			result.Error = errorMessage.String
-		}
+		result.Error = errorMessage.String
+		result.WorkerID = workerID.String
 
 		results = append(results, result)
 	}

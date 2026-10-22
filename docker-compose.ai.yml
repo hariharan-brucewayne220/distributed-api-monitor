@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15
@@ -30,7 +28,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - "D:\\models\\gpt-oss:/models"
+      # Directory holding the .gguf file, e.g. MODEL_DIR=D:\\models\\gpt-oss on Windows.
+      - "${MODEL_DIR:-./models}:/models"
     deploy:
       resources:
         reservations:
@@ -62,7 +61,8 @@ services:
       gpt-oss:
         condition: service_healthy
     volumes:
-      - ./web:/app/web
+      # The image's working directory is /root, so this live-reloads the dashboard.
+      - ./web:/root/web
 
 volumes:
   postgres_data:
