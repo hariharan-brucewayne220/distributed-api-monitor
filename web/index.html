@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>API Monitor Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"></script>
     <style>
         * {
             margin: 0;
@@ -220,7 +220,11 @@
             </div>
             <div class="stat-card">
                 <div class="stat-number warning" id="uptimePercent">-</div>
-                <div class="stat-label">Overall Uptime</div>
+                <div class="stat-label">Healthy Now</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number info" id="workersAlive">-</div>
+                <div class="stat-label" id="workersLabel">Workers Alive</div>
             </div>
         </div>
         
@@ -261,6 +265,14 @@
     </div>
 
     <script>
+        // Endpoint URLs are user-supplied and shared by every viewer, and
+        // insights come from an LLM: neither may be inserted as raw HTML.
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
         class APIMonitorDashboard {
             constructor() {
                 this.endpoints = [];
@@ -277,32 +289,48 @@
                 try {
                     // Load real data from API
                     const response = await fetch('/api/status');
+                    if (!response.ok) throw new Error(`/api/status returned ${response.status}`);
                     const data = await response.json();
 
                     this.updateDashboard(data);
                     await this.loadHistory(data.map(d => d.url));
                     this.updateChart(data);
+                    await this.loadWorkers();
                     await this.loadAIInsights();
                 } catch (error) {
+                    // Never substitute made-up statuses: say the data is unavailable.
                     console.error('Failed to load data:', error);
-                    // Fallback to mock data if API fails
-                    const mockData = this.generateMockData();
-                    this.updateDashboard(mockData);
-                    this.updateChart(mockData);
-                    this.generateAIInsights(mockData);
+                    document.getElementById('endpoints-container').innerHTML =
+                        `<div class="loading">Cannot reach the monitor API (${escapeHtml(error.message)}). Retrying every 5s.</div>`;
+                }
+            }
+
+            async loadWorkers() {
+                try {
+                    const response = await fetch('/api/workers');
+                    if (!response.ok) return;
+                    const workers = await response.json();
+                    const alive = workers.filter(w => w.alive);
+                    const regions = [...new Set(alive.map(w => w.region).filter(Boolean))];
+                    document.getElementById('workersAlive').textContent = alive.length;
+                    document.getElementById('workersLabel').textContent =
+                        regions.length ? `Workers Alive (${regions.join(', ')})` : 'Workers Alive';
+                } catch (error) {
+                    console.error('Failed to load workers:', error);
                 }
             }
 
             async loadAIInsights() {
                 try {
                     const response = await fetch('/api/insights');
+                    if (!response.ok) return;
                     const insights = await response.json();
-                    
+
                     const container = document.getElementById('insights-container');
                     container.innerHTML = insights.map(insight => `
                         <div class="insight-card">
-                            <div class="insight-title">${insight.title}</div>
-                            <div class="insight-content">${insight.content}</div>
+                            <div class="insight-title">${escapeHtml(insight.title)}</div>
+                            <div class="insight-content">${escapeHtml(insight.content)}</div>
                         </div>
                     `).join('');
                 } catch (error) {
@@ -310,37 +338,25 @@
                 }
             }
 
-            generateMockData() {
-                const urls = [
-                    'https://api.github.com/users/octocat',
-                    'https://jsonplaceholder.typicode.com/posts/1',
-                    'https://httpbin.org/status/200',
-                    'https://httpbin.org/delay/2'
-                ];
-
-                return urls.map(url => {
-                    const isHealthy = Math.random() > 0.2; // 80% healthy
-                    return {
-                        url,
-                        isHealthy,
-                        statusCode: isHealthy ? 200 : 500,
-                        responseTime: isHealthy ? Math.random() * 1000 + 100 : Math.random() * 5000 + 1000,
-                        lastChecked: new Date().toISOString()
-                    };
-                });
-            }
-
             updateDashboard(data) {
                 const healthy = data.filter(d => d.isHealthy).length;
                 const unhealthy = data.length - healthy;
-                // Convert nanoseconds to milliseconds
-                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime / 1000000, 0) / data.length;
-                const uptime = (healthy / data.length) * 100;
-
                 document.getElementById('healthyCount').textContent = healthy;
                 document.getElementById('unhealthyCount').textContent = unhealthy;
+
+                if (data.length === 0) {
+                    document.getElementById('avgResponseTime').textContent = '-';
+                    document.getElementById('uptimePercent').textContent = '-';
+                    document.getElementById('endpoints-container').innerHTML =
+                        '<div class="loading">No results yet. Waiting for a worker to check the endpoints...</div>';
+                    return;
+                }
+
+                // Convert nanoseconds to milliseconds
+                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime / 1000000, 0) / data.length;
+                const healthyPct = (healthy / data.length) * 100;
                 document.getElementById('avgResponseTime').textContent = Math.round(avgResponseTime) + 'ms';
-                document.getElementById('uptimePercent').textContent = uptime.toFixed(1) + '%';
+                document.getElementById('uptimePercent').textContent = healthyPct.toFixed(1) + '%';
 
                 this.updateEndpointsList(data);
             }
@@ -350,12 +366,12 @@
                 container.innerHTML = data.map(endpoint => `
                     <div class="endpoint-card ${endpoint.isHealthy ? 'healthy' : 'unhealthy'}">
                         <div class="endpoint-header">
-                            <div class="endpoint-url">${endpoint.url}</div>
+                            <div class="endpoint-url">${escapeHtml(endpoint.url)}</div>
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <div class="status-badge ${endpoint.isHealthy ? 'status-healthy' : 'status-unhealthy'}">
                                     ${endpoint.isHealthy ? '✅ Healthy' : '❌ Down'}
                                 </div>
-                                <button onclick="removeEndpoint('${endpoint.url}')" style="background: #ef4444; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 0.8rem;">Remove</button>
+                                <button class="remove-endpoint" data-url="${escapeHtml(endpoint.url)}" style="background: #ef4444; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 0.8rem;">Remove</button>
                             </div>
                         </div>
                         <div class="endpoint-metrics">
@@ -368,7 +384,11 @@
                             <div class="metric">
                                 <span>Last Check:</span> <strong>${new Date(endpoint.lastChecked).toLocaleTimeString()}</strong>
                             </div>
+                            <div class="metric">
+                                <span>Checked By:</span> <strong>${escapeHtml(endpoint.checkedBy || '-')}</strong>
+                            </div>
                         </div>
+                        ${endpoint.error ? `<div class="metric" style="margin-top: 8px; color: #b91c1c;">${escapeHtml(endpoint.error)}</div>` : ''}
                     </div>
                 `).join('');
             }
@@ -463,8 +483,8 @@
                 for (const d of data) {
                     const ds = this.datasetFor(d.url);
                     const x = new Date(d.lastChecked).getTime();
-                    // /api/history may already contain this exact check (it was
-                    // persisted by the same /api/status call); skip duplicates.
+                    // /api/status repeats the latest stored result until a worker
+                    // records a newer one, and /api/history may already hold it.
                     const last = ds.data[ds.data.length - 1];
                     if (!last || last.x !== x) {
                         ds.data.push({ x, y: d.responseTime / 1000000 });
@@ -475,56 +495,6 @@
                 }
 
                 this.chart.update();
-            }
-
-            generateAIInsights(data) {
-                const container = document.getElementById('insights-container');
-                
-                // Mock AI insights - replace with actual GPT-OSS integration
-                const insights = this.mockAIInsights(data);
-                
-                container.innerHTML = insights.map(insight => `
-                    <div class="insight-card">
-                        <div class="insight-title">${insight.title}</div>
-                        <div class="insight-content">${insight.content}</div>
-                    </div>
-                `).join('');
-            }
-
-            mockAIInsights(data) {
-                const unhealthy = data.filter(d => !d.isHealthy);
-                const slowEndpoints = data.filter(d => d.responseTime > 2000);
-                
-                const insights = [];
-                
-                if (unhealthy.length > 0) {
-                    insights.push({
-                        title: "🚨 Service Disruption Detected",
-                        content: `${unhealthy.length} endpoint(s) are currently down. Consider checking: ${unhealthy.map(e => e.url).join(', ')}`
-                    });
-                }
-                
-                if (slowEndpoints.length > 0) {
-                    insights.push({
-                        title: "⚠️ Performance Degradation",
-                        content: `${slowEndpoints.length} endpoint(s) showing elevated response times. May indicate increased load or network issues.`
-                    });
-                }
-                
-                const avgResponseTime = data.reduce((sum, d) => sum + d.responseTime, 0) / data.length;
-                if (avgResponseTime < 500) {
-                    insights.push({
-                        title: "✅ Optimal Performance",
-                        content: "All endpoints are performing within expected parameters. Average response time is excellent."
-                    });
-                }
-                
-                insights.push({
-                    title: "💡 Recommendation",
-                    content: "Consider setting up automated alerts for response times exceeding 3 seconds to proactively address performance issues."
-                });
-                
-                return insights;
             }
         }
 
@@ -611,6 +581,12 @@
 
         // Allow adding endpoint with Enter key
         document.addEventListener('DOMContentLoaded', () => {
+            // Remove buttons carry the URL in a data attribute rather than an
+            // inline onclick, so a URL containing quotes cannot break out.
+            document.getElementById('endpoints-container').addEventListener('click', (e) => {
+                const button = e.target.closest('.remove-endpoint');
+                if (button) removeEndpoint(button.dataset.url);
+            });
             document.getElementById('new-endpoint-url').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') {
                     addEndpoint();
